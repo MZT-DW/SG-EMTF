@@ -1,2 +1,2 @@
 # SG-EMTF
-Open source code, not yet finished
+Open source code, not finished yet
