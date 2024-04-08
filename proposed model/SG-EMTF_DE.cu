@@ -4,7 +4,7 @@
 #include <cuda_runtime_api.h>
 #include "curand_kernel.h"
 #include "cublas_v2.h"
-// #include "device_functions.h"
+#include "device_functions.h"
 #include<time.h>
 #include<iostream>
 #include<thread>
@@ -14,58 +14,49 @@
 #include <cooperative_groups.h>
 #include <sstream>
 #include <string>
+#include <iomanip>
 #include"semaphore.h"
 #include<vector>
-#include<map>
-#include<algorithm>
-#include<unistd.h>
-#include<sys/time.h>
-#include<queue>
-#include<chrono>
 
 #include <stdio.h>
 
-#define RAND_MAX 32767
 #define INDIVNUM 512//任务个体数
-#define INDIVNUM_ISLAND 128//种群个体数
+#define INDIVNUM_ISLAND 256//种群个体数
 #define SHARED_CAPACITY 10240//共享内存大小
 #define DIMENSION 50//维度大小
-#define CPU_THREAD_NUM 10000//CPU线程数
-#define ITER_NUM 1000//迭代数
+#define CPU_THREAD_NUM 1//CPU线程数
+#define ITER_NUM 10000//迭代数
 #define INTERVAL_TRANSFER 50//知识迁移间隔
-#define INTERVAL_MIGRA 25//种群迁移间隔
-#define TRANSFER_NUM 50//知识迁移的个体数
-#define T 10000//任务数
-#define ISLAND_NUM 4//孤岛数
+#define INTERVAL_MIGRA 20//种群迁移间隔
+#define TRANSFER_NUM 200//知识迁移的个体数
+#define T 1//任务数
+#define ISLAND_NUM 2//孤岛数
 #define VAL_TYPE 4 //4字节浮点数变量，即float
 #define BANKSIZE 32 //
 #define WARPSIZE 32
-#define BLOCK_NUM ((INDIVNUM - 1) / (INDIV_PERBLOCK * ISLAND_NUM) + 1)//最后一个Block可能人数不足
+#define INDIV_PERBLOCK 16//(SHARED_CAPACITY / (VAL_TYPE * 3 * DIMENSION))
+#define BLOCK_NUM ((INDIVNUM - 1) / (INDIV_PERBLOCK * 2) + 1)//最后一个Block可能人数不足
 #define F 0.5
 #define CROSSOVER_RATE 0.6
 #define ETA 2.f //模拟二进制交叉参数
 #define B_BASEVAL 100
 #define PM 2.f
 #define DM 5.f //多项式变异参数
-#define THREAD_FOR_OPERA 416  //(SHARED_CAPACITY / (VAL_TYPE * DIMENSION * 3)) //每个block里一个thread服务一个个体
-#define THREAD_FOR_TRANSFER 96 //用于数据传输的线程数
+#define THREAD_FOR_OPERA 448  //(SHARED_CAPACITY / (VAL_TYPE * DIMENSION * 3)) //每个block里一个thread服务一个个体
+#define THREAD_FOR_TRANSFER 64 //用于数据传输的线程数
 #define _THREAD_NUM (THREAD_FOR_OPERA + THREAD_FOR_TRANSFER) //GPU一个kernel的线程数
 #define E 2.718282 
 #define FULL_MASK 0xffffffff
 #define TASK_TYPENUM 7 //评估函数个数
-#define MIGRA_NUM 32
-// #define MIGRA_PERBLOCK MIGRA_NUM / BLOCK_NUM
-// #define MIGRA_PROP 1/8 //种群迁移的个体比例
-// #define MIGRA_PERBLOCK ((MIGRA_NUM - 1) / INDIV_PERBLOCK + 1)//(INDIV_PERBLOCK * MIGRA_PROP) //种群迁移个数
+#define MIGRA_NUM 100
+#define MIGRA_PERBLOCK MIGRA_NUM / BLOCK_NUM
+#define MIGRA_PROP 1/2 //种群迁移的个体比例
+#define MIGRA_NUM (INDIV_PERBLOCK * MIGRA_PROP) //种群迁移个数
 #define BESTNUM_PERTASK 50 //传回GPU的种群个体排序个数
 #define PI 3.1415926 
+#define STREAM_NUM 10 //流数量
 #define LOOPTIME 1 //每个Block内部数据传输间隙的循环次数
 #define SELECT_INTERVAL INDIV_PERBLOCK * ISLAND_NUM * INTERVAL_TRANSFER
-#define BATCH_NUM 100
-
-
-#define INDIV_PERBLOCK 8//(SHARED_CAPACITY / (VAL_TYPE * 3 * DIMENSION))
-#define STREAM_NUM 8 //流数量
 
 using namespace std;
 
@@ -89,8 +80,6 @@ struct Args{
 };
 */
 
-int* tasks_split = new int[BATCH_NUM + 1];
-float* st_time = new float[BATCH_NUM];
 float** INDIVIDUALS = new float*[CPU_THREAD_NUM];
 float** INDIV_BEST_GPU = new float*[CPU_THREAD_NUM];
 float** INDIVVAL_BEST_GPU = new float*[CPU_THREAD_NUM];
@@ -108,8 +97,7 @@ __constant__ float Range[TASK_TYPENUM * 2];
 int achieve_num = 0, iter_time = 0, waiting_num = 0, transfer_num = T, finish_num = 0;
 int max_iter[T];
 __device__ float Weierstrass_para;
-pthread_mutex_t iter_mutex=PTHREAD_MUTEX_INITIALIZER;
-// mutex iter_mutex;
+mutex iter_mutex;
 condition_variable wait_line, finish_line;
 semaphore pv(5);
 int* select_interval[T];
@@ -186,10 +174,10 @@ __global__ void para_init(curandState* states, float** M, float** b, int* task_c
 		int range = Range[type * 2 + 1] - Range[type * 2];
 		M[tid / DIMENSION][tid % DIMENSION] = curand_uniform(&states[tid % (_THREAD_NUM * BLOCK_NUM * STREAM_NUM)]);
 		b[tid / DIMENSION][tid % DIMENSION] = curand_uniform(&states[tid % (_THREAD_NUM * BLOCK_NUM * STREAM_NUM)]) * range;
-		//if(tid / DIMENSION == 0){
-		//	M[tid / DIMENSION][tid % DIMENSION] = 1;curand_uniform(&states[tid % (_THREAD_NUM * BLOCK_NUM * STREAM_NUM)]);
-		//	b[tid / DIMENSION][tid % DIMENSION] = 0;curand_uniform(&states[tid % (_THREAD_NUM * BLOCK_NUM * STREAM_NUM)]) * range;
-		//}
+		if(tid / DIMENSION == 0){
+			M[tid / DIMENSION][tid % DIMENSION] = 1;curand_uniform(&states[tid % (_THREAD_NUM * BLOCK_NUM * STREAM_NUM)]);
+			b[tid / DIMENSION][tid % DIMENSION] = 0;curand_uniform(&states[tid % (_THREAD_NUM * BLOCK_NUM * STREAM_NUM)]) * range;
+		}
 		tid += t_n;
 	}
 }
@@ -214,13 +202,12 @@ void rangeInit() {
 }
 
 void popTransfer() {
-	
 	for (int i = 0; i < CPU_THREAD_NUM; ++i) {
 		INDIVIDUALS_CPU[i] = new float[INDIVNUM * DIMENSION];
 		INDIV_VAL_CPU[i] = new float[INDIVNUM];
 		INDIV_BEST_CPU[i] = new float[BESTNUM_PERTASK * DIMENSION];
 		INDIVVAL_BEST_CPU[i] = new float[BESTNUM_PERTASK];
-		
+
 		cudaMemcpy(INDIVIDUALS_CPU[i], INDIVIDUALS[i], INDIVNUM * DIMENSION * sizeof(float), cudaMemcpyDeviceToHost);
 		cudaMemcpy(INDIV_VAL_CPU[i], indiv_val[i], INDIVNUM * sizeof(float), cudaMemcpyDeviceToHost);
 		cudaMemcpy(INDIV_BEST_CPU[i], INDIV_BEST_GPU[i], BESTNUM_PERTASK * DIMENSION * sizeof(float), cudaMemcpyDeviceToHost);
@@ -241,55 +228,6 @@ void popTransfer_(int cthread_idx, cudaStream_t* stream) {
 
 }
 
-void paraSave(float** M_cpu, float** b_cpu, int* task_choice){
-	ofstream file;
-	file.open("para.txt", ios::out);
-	float* M_C = new float[DIMENSION * T], *b_C = new float[DIMENSION * T];
-	for(int i = 0; i < T; ++i){
-		cudaMemcpy(M_C + DIMENSION * i, M_cpu[i], DIMENSION * sizeof(float), cudaMemcpyDeviceToHost);
-		cudaMemcpy(b_C + DIMENSION * i, b_cpu[i], DIMENSION * sizeof(float), cudaMemcpyDeviceToHost);
-	}
-	for(int j = 0; j < T; ++j){
-		for(int i = 0; i < DIMENSION; ++i){
-			file << M_C[j * DIMENSION + i] << ' ' << b_C[j * DIMENSION + i] << ' ';
-		}
-		file << endl;
-	}
-	file << endl;
-	for(int i = 0; i < T; ++i){
-		file << task_choice[i] << ' ';
-	}
-	file << endl;
-	file.close();
-}
-
-void getRandNum(int* a, int n, int min, int max){
-	if(n == 0){
-		return;
-	}
-	int rd = rand() % (max - min + 1) + min;
-	for(int i = 0; i < n; ++i){
-		while(1){
-			bool flag = true;
-			for(int j = 0; j < i; ++j){
-				if(rd == a[j]){
-					flag = false;
-					break;
-				}
-			}
-			if(flag){
-				break;
-			}
-			rd = rand() % (max - min + 1) + min;
-		}
-		a[i] = rd;
-	}
-}
-
-float getRandFloat(float min, float max){
-	return ((float)(rand() % RAND_MAX) / (float)RAND_MAX) + min + float(rand() % int(max - min));
-}
-
 void initialization() {//数据传输至显存，随机数种子的初始化
 
 		//初始化事件
@@ -297,8 +235,8 @@ void initialization() {//数据传输至显存，随机数种子的初始化
     //pthread_cond_init(&finish_line, NULL);
 
 					   //个体生成和初始化
-	int syncval_cpu[((INTERVAL_TRANSFER - 1) / LOOPTIME + 1) * ISLAND_NUM];
-	for(int i = 0; i < ((INTERVAL_TRANSFER - 1) / LOOPTIME + 1) * ISLAND_NUM; ++i){
+	int syncval_cpu[((INTERVAL_TRANSFER - 1) / LOOPTIME + 1) * 2];
+	for(int i = 0; i < ((INTERVAL_TRANSFER - 1) / LOOPTIME + 1) * 2; ++i){
 		syncval_cpu[i] = 0;
 	}
 	rangeInit();
@@ -308,13 +246,13 @@ void initialization() {//数据传输至显存，随机数种子的初始化
 	for(int i = 0; i < CPU_THREAD_NUM; ++i){
 		tasks_type[i] = rand() % 7;
 		if(i == 0){
-			tasks_type[i] = 6;
+			tasks_type[i] = 0;
 		}
 	}
-	srand(0);
+	srand(time(0));
 	for (int i = 0; i < CPU_THREAD_NUM; ++i) {
         achieve[i] = false;
-        max_iter[i] = 1;
+        max_iter[i] = 3;
 		INDIVIDUALS[i] = new float[INDIVNUM * DIMENSION];
 		indiv_val[i] = new float[INDIVNUM];
 		indiv_sort[i] = new DS[(INDIVNUM - 1) / BANKSIZE + 1];//上取整
@@ -330,8 +268,8 @@ void initialization() {//数据传输至显存，随机数种子的初始化
 
 		cudaMemcpy(task_type[i], &tasks_type[i], sizeof(int), cudaMemcpyHostToDevice);
 
-		cudaMalloc((void**)&syncval[i], sizeof(int) * ((INTERVAL_TRANSFER - 1) / LOOPTIME + 1) * ISLAND_NUM);
-		cudaMemcpy(syncval[i], &syncval_cpu, sizeof(int) * ((INTERVAL_TRANSFER - 1) / LOOPTIME + 1) * ISLAND_NUM, cudaMemcpyHostToDevice);
+		cudaMalloc((void**)&syncval[i], sizeof(int) * ((INTERVAL_TRANSFER - 1) / LOOPTIME + 1) * 2);
+		cudaMemcpy(syncval[i], &syncval_cpu, sizeof(int) * ((INTERVAL_TRANSFER - 1) / LOOPTIME + 1) * 2, cudaMemcpyHostToDevice);
 
 	}
 		cudaMemcpy(task_choice, &tasks_type, sizeof(int) * T, cudaMemcpyHostToDevice);
@@ -366,17 +304,10 @@ void initialization() {//数据传输至显存，随机数种子的初始化
 	cudaMalloc((void**)&devStates, sizeof(curandState) * total_threadnum);
 
 	int blocknum = STREAM_NUM;
-	curandInit << <blocknum * BLOCK_NUM, _THREAD_NUM >> > (devStates, 0);
-	//curandInit << <blocknum * BLOCK_NUM, _THREAD_NUM >> > (devStates, rand());
+	//curandInit << <blocknum * BLOCK_NUM, _THREAD_NUM >> > (devStates, 0);
 
 	para_init << <T, INDIVNUM >> > (devStates, M, b, task_choice);
-	//curandInit << <blocknum * BLOCK_NUM, _THREAD_NUM >> > (devStates, rand());
-	
-
-	srand(time(0));
 	curandInit << <blocknum * BLOCK_NUM, _THREAD_NUM >> > (devStates, rand());
-
-	paraSave(M_cpu, b_cpu, tasks_type);
 }
 
 __device__ void _swap(float** a, float** b) {
@@ -484,7 +415,6 @@ __global__ void popSort(DS* indiv_sort, float* indiv_val, float* INDIVIDUALS, in
 		tid += t_n;
 	}
 }
-
 __device__ void getSum(int new_dim, float* temp_middle, int indivs_num, int indiv_perblock = INDIV_PERBLOCK) {
 	const int t_n = THREAD_FOR_OPERA;
 	while (true) {//数组求和
@@ -531,10 +461,6 @@ __device__ void getMulti(int new_dim, float* temp_middle, int indivs_num, int in
 }
 
 
-__device__ __forceinline__ void namedBarrierSync(int name, int numThreads){
-	asm volatile("bar.sync %0, %1;": : "r"(name), "r"(numThreads):"memory");
-}
-
 __device__ float atomicMul(float* address, float val) 
 { 
   unsigned int* address_as_ull = (unsigned int*)address; 
@@ -552,23 +478,23 @@ __device__ void Mutation(int indiv_num, int n, curandState* state,  float* indiv
 	int group_interval = indiv_perblock * DIMENSION;
 
 	float range = rand[1] - rand[0];
-    float P = 1.f;
-
-	/*
+    float P = 1.f / DIMENSION;
+    
+	__shared__ int temp[indiv_num];
 	while(tid < indiv_num){
-		r[tid + indiv_perblock * 3] = curand(state) % DIMENSION;
+		temp[tid] = curand(state) % DIMENSION;
 		tid += t_n;
 	}
-	*/
+	__syncthreads();
 	tid = threadIdx.x;
 	//变异
 	while (tid < indiv_num * DIMENSION) {
-		/*
-		if(curand_uniform(state) > CROSSOVER_RATE && tid / indiv_num != int(r[tid % indiv_num + indiv_perblock * 3])){
-			indivs_in_s[(tid / indiv_num) * indiv_perblock + tid % indiv_num + group_interval * 2] = indivs_in_s[(tid / indiv_num) * indiv_perblock + tid % indiv_num + group_interval * (1 - n)];
-		}
-		*/
 		
+		if(curand_uniform(state) > CROSSOVER_RATE && tid / indiv_num != int(temp[tid % indiv_num])){
+			indivs_in_s[tid + group_interval * 2] = indivs_in_s[tid + group_interval * (1 - n)];
+		}
+		
+		/*
 		float r = curand_uniform(state);
 		
         if (r < P) {
@@ -600,7 +526,7 @@ __device__ void Mutation(int indiv_num, int n, curandState* state,  float* indiv
 			indivs_in_s[group_interval * 2 + indiv_idx] = temp_indiv_1;
             
 		}
-        
+        */
 		tid += THREAD_FOR_OPERA;
 	}
 }
@@ -629,11 +555,11 @@ __device__ void CrossOver(int indiv_num, int n, curandState* state,  float* indi
 	
 	//===============================================================================
 	
-		/*
+		
 	while(tid < indiv_num){
 		int r1 = curand(state) % indiv_num;
 		int r2 = curand(state) % indiv_num;
-		while((r1 == r2) && indiv_num >= 3){
+		while((r1 == r2) && indiv_num >= 2){
 			r2 = curand(state) % indiv_num;
 		}
 		int r3 = curand(state) % indiv_num;
@@ -654,7 +580,7 @@ __device__ void CrossOver(int indiv_num, int n, curandState* state,  float* indi
 		int base = (tid / indiv_num) * indiv_perblock + group_interval * (1 - n);
 
 		indivs_in_s[group_interval * 2 + id] 
-		= indivs_in_s[r1 + base]
+		= indivs_in_s[tid % indiv_num + base]
 		+ F * (indivs_in_s[r2 + base] - indivs_in_s[r3 + base]);
 
 			if (indivs_in_s[group_interval * 2 + id]  > rand[1]) {
@@ -665,7 +591,7 @@ __device__ void CrossOver(int indiv_num, int n, curandState* state,  float* indi
 				indivs_in_s[group_interval * 2 + id]  = rand[0];
 				//randDb(range[0], range[1], &temp_indiv_1, states);
 			}
-		*/
+		
 	/*
 	while(tid < indiv_num * DIMENSION){
 		int idx = tid / DIMENSION;//个体id
@@ -708,6 +634,7 @@ __device__ void CrossOver(int indiv_num, int n, curandState* state,  float* indi
 		tid += THREAD_FOR_OPERA;
 	}
 	*/
+    /*
 	while(tid < indiv_num * DIMENSION){
 		int idx = tid % indiv_num;//个体id
 		int r0 = r[idx], r1 = r[idx + 1];
@@ -742,7 +669,7 @@ __device__ void CrossOver(int indiv_num, int n, curandState* state,  float* indi
 			temp_indiv_1 = temp_indiv_2;
 		}
 		indivs_in_s[group_interval * 2 + tid] = temp_indiv_1;
-		
+		*/
 
 		
 		tid += THREAD_FOR_OPERA;
@@ -756,13 +683,22 @@ __device__ void Selection(int indiv_num, int n,  float* indivs_eval,  float* ind
 	int indiv_perblock = INDIV_PERBLOCK;
 	int group_interval = indiv_perblock * DIMENSION;
 
+	while (tid < indiv_num) {
+		if (indivs_eval[tid + indiv_perblock * (1 - n)] >= indivs_eval[indiv_perblock * 2 + tid]) {
+			indivs_eval[tid + indiv_perblock * (1 - n)] = indivs_eval[indiv_perblock * 2 + tid];
+			temp_judge[tid] = 1;
+		}
+		else {
+			temp_judge[tid] = 0;
+		}
+		tid += THREAD_FOR_OPERA;
+	}
+	__syncthreads();
+	tid = threadIdx.x;
 	while (tid < indiv_num * DIMENSION) {
-		if (indivs_eval[tid % indiv_num + indiv_perblock * (1 - n)] >= indivs_eval[indiv_perblock * 2 + tid % indiv_num]) {
+		if (temp_judge[tid % indiv_num] == 1) {
 			int indiv_idx = tid / indiv_num * indiv_perblock + tid % indiv_num;
 			indivs_in_s[group_interval * (1 - n) + indiv_idx] = indivs_in_s[group_interval * 2 + indiv_idx];
-			if(tid / indiv_num == 0){
-				indivs_eval[tid % indiv_num + indiv_perblock * (1 - n)] = indivs_eval[indiv_perblock * 2 + tid % indiv_num];
-			}
 		}
 		tid += THREAD_FOR_OPERA;
 	}
@@ -810,7 +746,7 @@ __device__ void CrossPrep(float* r, int indiv_num, int t_n, int n, curandState* 
 		//}
 		tid += t_n;
 	}
-	namedBarrierSync(1, _THREAD_NUM - init_thread);
+	__syncthreads();
 	/*
 	while (tid < LOOPTIME * indiv_num) {//把beta先计算出来
 		int r_idx = init_posi + (tid / indiv_num) * indiv_perblock + tid % indiv_num;
@@ -853,18 +789,18 @@ __device__ void indivval_test( float* indivs_in_s,  float* indiv_val, int init_t
 				}
 	}
 }
-__device__ void SharedToGlobal(float* indivs,  float* indivs_in_s,  float* indivs_eval, float* eval, curandState* state, int* shuffle, int n, int n_island,  int thread_num) {
+__device__ void SharedToGlobal(float* indivs,  float* indivs_in_s,  float* indivs_eval, float* eval, curandState* state, int* shuffle, int n, int thread_num) {
 	int threads_for_opera = _THREAD_NUM - thread_num;
 	int tid = threadIdx.x - threads_for_opera, t_n = thread_num;
 	int indiv_perblock = INDIV_PERBLOCK, group_interval = indiv_perblock * DIMENSION;
-	int init_posi = blockIdx.x * (group_interval * ISLAND_NUM);
+	int init_posi = blockIdx.x * (group_interval * 2);
 	//洗牌算法
 	while (tid < indiv_perblock) {
 		shuffle[tid] = tid;
 		tid += t_n;
 	}
 	
-	namedBarrierSync(1, thread_num);
+	__syncthreads();
 	tid = threadIdx.x - threads_for_opera;
 	
 	if (tid == 0) {//目前采用单线程
@@ -881,15 +817,15 @@ __device__ void SharedToGlobal(float* indivs,  float* indivs_in_s,  float* indiv
 		//if(blockIdx.x == 0 && threadIdx.x > THREAD_FOR_OPERA && t_n == _THREAD_NUM){
 			//printf("tid:%d\n", tid);
 		//}
-	namedBarrierSync(1, thread_num);
+	__syncthreads();
 	while (tid < indiv_perblock * DIMENSION) {
-		indivs[init_posi + indiv_perblock * DIMENSION * n_island + shuffle[tid / DIMENSION] * DIMENSION + tid % DIMENSION] = indivs_in_s[group_interval * n + (tid % DIMENSION) * indiv_perblock + (tid / DIMENSION)];
+		indivs[init_posi + indiv_perblock * DIMENSION * n + shuffle[tid / DIMENSION] * DIMENSION + tid % DIMENSION] = indivs_in_s[group_interval * n + (tid % DIMENSION) * indiv_perblock + (tid / DIMENSION)];
 		tid += t_n;
 	}
 
 	tid = threadIdx.x - threads_for_opera;
 	while (tid < indiv_perblock) {
-		eval[blockIdx.x * indiv_perblock * ISLAND_NUM + shuffle[tid] + indiv_perblock * n_island] = indivs_eval[indiv_perblock * n + tid];
+		eval[blockIdx.x * indiv_perblock * 2 + shuffle[tid] + indiv_perblock * n] = indivs_eval[indiv_perblock * n + tid];
 		tid += t_n;
 	}
 
@@ -900,7 +836,6 @@ __device__ void evaluation(int type, float* M_s, float* b_s,  float* indivs_in_s
 	int marray_size = (WARPSIZE / indiv_perblock + 1) * indiv_perblock;
 	int offset = WARPSIZE % indivs_num;
 	int remainder = (WARPSIZE / indivs_num + 1) * indivs_num;//remainder需要保证小于等于marray_size
-	
 	int step_size = WARPSIZE;
 	if (WARPSIZE < indivs_num) {
 		offset = 0;
@@ -912,7 +847,7 @@ __device__ void evaluation(int type, float* M_s, float* b_s,  float* indivs_in_s
 		temp_try[tid] = 0;
 		tid += THREAD_FOR_OPERA;
 	}
-	namedBarrierSync(2, THREAD_FOR_OPERA);
+	__syncthreads();
 	
     switch (type) {
 	case 0://Shpere
@@ -924,7 +859,7 @@ __device__ void evaluation(int type, float* M_s, float* b_s,  float* indivs_in_s
 			atomicAdd(&temp_try[(offset * (tid / step_size) + (tid % step_size)) % remainder], result);
 			tid += THREAD_FOR_OPERA;
 		}
-		namedBarrierSync(2, THREAD_FOR_OPERA);
+		__syncthreads();
 		if (threadIdx.x < indivs_num) {
 			tid = threadIdx.x;
 			float temp_val = 0;
@@ -948,7 +883,7 @@ __device__ void evaluation(int type, float* M_s, float* b_s,  float* indivs_in_s
 			atomicAdd(&temp_try[(offset * (tid / step_size) + (tid % step_size)) % remainder], result); 
 			tid += THREAD_FOR_OPERA;
 		}
-		namedBarrierSync(2, THREAD_FOR_OPERA);
+		__syncthreads();
 		if (threadIdx.x < indivs_num) {
 			tid = threadIdx.x;
 			float temp_val = 0;
@@ -972,7 +907,15 @@ __device__ void evaluation(int type, float* M_s, float* b_s,  float* indivs_in_s
 			   atomicAdd(&temp_try[bank_idx + marray_size * 2], cospif(2 * x));
 			   tid += THREAD_FOR_OPERA;
 		   }
-			namedBarrierSync(2, THREAD_FOR_OPERA);
+		   /*
+		   if (threadIdx.x < remainder) {
+			   temp_try[threadIdx.x + marray_size] /= DIMENSION;
+			   temp_try[threadIdx.x + marray_size * 2] /= DIMENSION;
+			   //float result = -20 * expf(-0.2 * sqrtf(temp_try[threadIdx.x + marray_size])) - expf(temp_try[threadIdx.x + marray_size * 2]) + 20 + E;
+			   //temp_try[threadIdx.x] = result;
+		   }
+		   */
+		   __syncthreads();
 			if (threadIdx.x < indivs_num) {
 				tid = threadIdx.x;
 				float temp_val = 0;
@@ -984,7 +927,24 @@ __device__ void evaluation(int type, float* M_s, float* b_s,  float* indivs_in_s
 				}
 				float result = -20 * expf(-0.2 * sqrtf(temp_val / DIMENSION)) - expf(temp_val_1 / DIMENSION) + 20 + E;
 				eval[threadIdx.x] = result;
-				
+				/*
+				result = 0;
+				float result_1 = 0;
+				for(int i = 0; i < DIMENSION; ++i){
+					float x1 = M_s[i] * indivs_in_s[i * indiv_perblock + threadIdx.x] + b_s[i];
+					result += x1 * x1;
+					result_1 += cosf(2 * 3.1415926 * x1);
+				}
+				result = -20 * expf(-0.2 * sqrtf(result / 50)) - expf(result_1 / 50) + 20 + 2.718282;
+				if(fabs( eval[threadIdx.x]- result) >= 1){
+					printf("sth wrong..:%f,%f\n", result, eval[threadIdx.x]);
+					for(int i = 0; i < DIMENSION; ++i){
+						float x1 = M_s[i] * indivs_in_s[i * indiv_perblock + threadIdx.x] + b_s[i];
+						printf("%f ", x1);
+					}
+				printf("\n");
+				}
+				*/
 		   }
 		
 		break;
@@ -999,7 +959,7 @@ __device__ void evaluation(int type, float* M_s, float* b_s,  float* indivs_in_s
 			atomicAdd(&temp_try[(offset * (tid / step_size) + (tid % step_size)) % remainder], result);
 			tid += THREAD_FOR_OPERA;
 		}
-		namedBarrierSync(2, THREAD_FOR_OPERA);
+		__syncthreads();
 		if (threadIdx.x < indivs_num) {
 			tid = threadIdx.x;
 			float temp_val = 0;
@@ -1019,18 +979,18 @@ __device__ void evaluation(int type, float* M_s, float* b_s,  float* indivs_in_s
 			temp_try[tid + marray_size * 2] = 1;
 			tid += THREAD_FOR_OPERA;
 		}
-		namedBarrierSync(2, THREAD_FOR_OPERA);
+		__syncthreads();
 		tid = threadIdx.x;
 		while (tid < DIMENSION * indivs_num) {
 			int dimen = tid / indivs_num;
 			float x = M_s[dimen] * (indivs_in_s[dimen * indiv_perblock + tid % indivs_num] + b_s[dimen]);
 			int bank_idx = (offset * (tid / step_size) + (tid % step_size)) % remainder;
 			atomicAdd(&temp_try[bank_idx + marray_size], x * x);
-			// float old_val = atomicMul(&temp_try[bank_idx + marray_size * 2], cosf(x / sqrtf(tid / indivs_num + 1)));
-			// //printf("%f = %f mul %f\n", temp_try[bank_idx + marray_size * 2], old_val, cosf(x / sqrtf(tid / indivs_num + 1)));
+			float old_val = atomicMul(&temp_try[bank_idx + marray_size * 2], cosf(x / sqrtf(tid / indivs_num + 1)));
+			//printf("%f = %f mul %f\n", temp_try[bank_idx + marray_size * 2], old_val, cosf(x / sqrtf(tid / indivs_num + 1)));
 			tid += THREAD_FOR_OPERA;
 		}
-		namedBarrierSync(2, THREAD_FOR_OPERA);
+		__syncthreads();
 		if (threadIdx.x < indivs_num) {
 			tid = threadIdx.x;
 			float temp_val_1 = 0, temp_val_2 = 1;
@@ -1064,7 +1024,7 @@ __device__ void evaluation(int type, float* M_s, float* b_s,  float* indivs_in_s
 			atomicAdd(&temp_try[(offset * (tid / step_size) + (tid % step_size)) % remainder], result);
 			tid += THREAD_FOR_OPERA;
 		}
-		namedBarrierSync(2, THREAD_FOR_OPERA);
+		__syncthreads();
 		if (threadIdx.x < indivs_num) {
 			tid = threadIdx.x;
 			float temp_val = 0;
@@ -1086,7 +1046,7 @@ __device__ void evaluation(int type, float* M_s, float* b_s,  float* indivs_in_s
 			atomicAdd(&temp_try[(offset * (tid / step_size) + (tid % step_size)) % remainder], result);
 			tid += THREAD_FOR_OPERA;
 		}
-		namedBarrierSync(2, THREAD_FOR_OPERA);
+		__syncthreads();
 		if (threadIdx.x < indivs_num) {
 			tid = threadIdx.x;
 			float temp_val = 0;
@@ -1095,38 +1055,34 @@ __device__ void evaluation(int type, float* M_s, float* b_s,  float* indivs_in_s
 				tid += indivs_num;
 			}
 
-			eval[threadIdx.x] = 418.9829f * DIMENSION - temp_val;eval[threadIdx.x] = 418.9829f * DIMENSION - temp_val;
+			eval[threadIdx.x] = 418.9829f * DIMENSION - temp_val;
 		}
 		
 		break;
 	}
-	/*
-	if(threadIdx.x == 0 && blockIdx.x == 0 && eval[threadIdx.x] == 0){
-		for(int i = 0; i < DIMENSION; ++i){
-			printf("%f, ", M_s[i] * (indivs_in_s[i * indiv_perblock + threadIdx.x] + b_s[i]));
-		}
-		printf("\n");
-	}
-	*/
+    if(threadIdx.x == 0 && blockIdx.x == 0 && eval[threadIdx.x] == 0){
+        for(int i = 0; i < DIMENSION; ++i){
+            printf("%f, ", indivs_in_s[i * indiv_perblock + threadIdx.x]);
+        }
+        printf("\n");
+    }
 }
 
 
 __device__ void paritySort(float* indivs_val, int* idx, int tid, int num) {//奇偶交换排序
     int max_num = ((num / 2) / WARPSIZE + 1) * WARPSIZE;
-	if (tid < num) {
-		// if (tid % 2 == 1) {
-		// 	tid += num / 2;
-		// 	tid += tid % 2;
-		// }
+	if (tid < (max_num)) {
+		if (tid % 2 == 1) {
+			tid += num / 2;
+			tid += tid % 2;
+		}
 		for (int i = 0; i < num; i++) {
-			if(tid % 2 == 0){
-				int temp_id = tid + (i % 2);
-				if (temp_id + 1 < num) 
-				{
-					if(indivs_val[idx[temp_id]] > indivs_val[idx[temp_id + 1]]){
-						_swap(&idx[temp_id], &idx[temp_id + 1]);
-					}
-				}
+			int temp_id = tid + (i % 2);
+			if (temp_id + 1 < num) 
+            {
+                if(indivs_val[idx[temp_id]] > indivs_val[idx[temp_id + 1]]){
+			        _swap(&idx[temp_id], &idx[temp_id + 1]);
+                }
 			}
 			if(max_num > WARPSIZE){
 				__syncthreads();
@@ -1146,7 +1102,6 @@ __device__ void IslandMigration(int* idx_forSort, float* indivs_eval, float* ind
 		idx_forSort[tid] = tid % arraySize;
 		tid += t_n;
 	}
-	__threadfence();
 	__syncthreads();
 
 
@@ -1163,61 +1118,58 @@ __device__ void IslandMigration(int* idx_forSort, float* indivs_eval, float* ind
 		tid += t_n;
 	}
 
-	__threadfence();
 	__syncthreads();
 	
 	//岛间迁移
 	tid = threadIdx.x;
-	int migra_num = MIGRA_NUM / gridDim.x;
-	if (blockIdx.x < MIGRA_NUM % gridDim.x) {
-		migra_num += 1;
-	}
-	
-	
-	tid = threadIdx.x;
-	while (tid < migra_num * DIMENSION) {
-		int migra_id = tid % migra_num;
-		int init_dimen = (tid / migra_num) * indiv_perblock;
-		int targetId = idx_forSort[migra_id], targetId_1 = indiv_num + idx_forSort[arraySize + migra_id];
-		int selfId = indiv_num + idx_forSort[arraySize + indiv_num - migra_id - 1], selfId_1 = idx_forSort[indiv_num - migra_id - 1];
-
-		if (indivs_eval[targetId] < indivs_eval[selfId]) {
-			// printf("%d, %d\n", idx_forSort[arraySize + indiv_num - migra_id - 1], idx_forSort[migra_id]);
-			indivs_in_s[indiv_perblock * DIMENSION + init_dimen + idx_forSort[arraySize + indiv_num - migra_id - 1]] = indivs_in_s[init_dimen + idx_forSort[migra_id]];
-		}
-		if (indivs_eval[targetId_1] < indivs_eval[selfId_1]) {
-			// printf("-%d, %d\n", idx_forSort[indiv_num - tid % MIGRA_NUM - 1], idx_forSort[arraySize + migra_id]);
-			indivs_in_s[init_dimen + selfId_1] = indivs_in_s[indiv_perblock * DIMENSION + init_dimen + idx_forSort[arraySize + migra_id]];
-		}
-		tid += t_n;
+	__shared__ int temp[MIGRA_NUM * 2];//每个个体一个单元，标记是否迁移
+	int migra_num = indiv_num * MIGRA_PROP;
+	if (indiv_num < indiv_num) {
+		migra_num = indiv_num * MIGRA_PROP;
 	}
 
-	__threadfence();
-	__syncthreads();
-
-	tid = threadIdx.x;
 	while (tid < migra_num) {
-		int selfId = indiv_num + idx_forSort[arraySize + indiv_num - tid - 1];
+		int selfId = indiv_num + idx_forSort[tid + arraySize + indiv_num - migra_num];
 		int targetId = idx_forSort[tid];
 		if (indivs_eval[targetId] < indivs_eval[selfId]) {
 			indivs_eval[selfId] = indivs_eval[targetId];
+			temp[tid] = 1;
+		}
+		else {
+			temp[tid] = 0;
 		}
 		tid += t_n;
 	}
 	tid = threadIdx.x - migra_num;
 	while (tid < migra_num) {
 		int targetId = indiv_num + idx_forSort[arraySize + tid];
-		int selfId = idx_forSort[indiv_num - tid - 1];
+		int selfId = idx_forSort[tid + indiv_num - migra_num];
 		if (indivs_eval[targetId] < indivs_eval[selfId]) {
 			indivs_eval[selfId] = indivs_eval[targetId];
+			temp[migra_num + tid] = 1;
+		}
+		else {
+			temp[migra_num + tid] = 0;
 		}
 		tid += t_n;
 	}
 
+	__syncthreads();
+	tid = threadIdx.x;
+	while (tid < migra_num * DIMENSION) {
+		int init_dimen = (tid / migra_num) * indiv_perblock;
+		if (temp[tid % migra_num] == 1) {
+			indivs_in_s[indiv_perblock * DIMENSION + init_dimen + idx_forSort[arraySize + indiv_num - tid % migra_num - 1]] = indivs_in_s[init_dimen + idx_forSort[tid % migra_num]];
+		}
+		if (temp[migra_num + tid % migra_num] == 1) {
+			indivs_in_s[init_dimen + idx_forSort[indiv_num - tid % MIGRA_NUM - 1]] = indivs_in_s[indiv_perblock * DIMENSION + init_dimen + idx_forSort[arraySize + tid % migra_num]];
+		}
+		tid += t_n;
+	}
 	
 }
 
-__device__ void SelectFromBlocks(int n,  int n_island, float* indivs_in_s,  float* indivs_eval, float* indivs, float* eval, int* select_interval, int iter) {
+__device__ void SelectFromBlocks(int n,  float* indivs_in_s,  float* indivs_eval, float* indivs, float* eval, int* select_interval, int iter) {
 	int tid = threadIdx.x - THREAD_FOR_OPERA;
 	int indiv_perblock = INDIV_PERBLOCK, group_interval = indiv_perblock * DIMENSION;
 	__shared__ int targetblock[INDIV_PERBLOCK];
@@ -1239,11 +1191,11 @@ __device__ void SelectFromBlocks(int n,  int n_island, float* indivs_in_s,  floa
 			}
 		}
 		*/
-		indivs_eval[indiv_perblock * n + tid] = eval[indiv_perblock * targetblock[tid] * ISLAND_NUM + indiv_perblock * n_island + tid];
+		indivs_eval[indiv_perblock * n + tid] = eval[indiv_perblock * targetblock[tid] * 2 + indiv_perblock * n + tid];
 		tid += THREAD_FOR_TRANSFER;
 	}
 
-	namedBarrierSync(1, THREAD_FOR_TRANSFER);
+	__syncthreads();
 	tid = threadIdx.x - THREAD_FOR_OPERA;
 	while (tid < indiv_perblock * DIMENSION) {
 		//从自己开始，往后读取第几个block? (tid / (2 * DIMENSION)) % BLOCK_NUM + 1,不用+1
@@ -1253,7 +1205,7 @@ __device__ void SelectFromBlocks(int n,  int n_island, float* indivs_in_s,  floa
 				interval = indiv_final[0];
 		}
 		*/
-		indivs_in_s[group_interval * n + (tid % DIMENSION) * indiv_perblock + indiv_id] = indivs[group_interval * targetblock[indiv_id] * ISLAND_NUM + indiv_perblock * DIMENSION * n_island + tid];
+		indivs_in_s[group_interval * n + (tid % DIMENSION) * indiv_perblock + indiv_id] = indivs[group_interval * targetblock[indiv_id] * 2 + indiv_perblock * DIMENSION * n + tid];
 		tid += THREAD_FOR_TRANSFER;
 	}
 
@@ -1285,7 +1237,7 @@ __device__ void eval_test(float* INDIVIDUALS, float* indivs_val){
 	}
 }
  
-
+ 
 __global__ void GeneticOpera(float* indivs, volatile int* syncval, curandState* states, int* type, float* M, float* b, float* eval, int* select_interval) {
 	
 	
@@ -1303,7 +1255,7 @@ __global__ void GeneticOpera(float* indivs, volatile int* syncval, curandState* 
 	int tid = threadIdx.x;
 	int indiv_perblock = INDIV_PERBLOCK;
 	int group_interval = indiv_perblock * DIMENSION;//SHARED_CAPACITY / (VAL_TYPE * 3);//个体向量、子个体向量、下一步迭代需要的向量：总共需要三份，一份一间隔
-	int init_posi = blockIdx.x * (group_interval * ISLAND_NUM);//有双倍，分时进行
+	int init_posi = blockIdx.x * (group_interval * 2);//有双倍，分时进行
 	int indiv_num = indiv_perblock;
 
 	while (tid < indiv_num * DIMENSION) {
@@ -1311,7 +1263,6 @@ __global__ void GeneticOpera(float* indivs, volatile int* syncval, curandState* 
 		indivs_in_s[(tid % DIMENSION) * indiv_perblock + (tid / DIMENSION)] = indivs[init_posi + tid];
 		tid += _THREAD_NUM;
 	}
-
 	tid = threadIdx.x;
 	while (tid < indiv_num) {
 		indivs_eval[tid] = eval[blockIdx.x * indiv_perblock * 2 + tid];
@@ -1323,42 +1274,43 @@ __global__ void GeneticOpera(float* indivs, volatile int* syncval, curandState* 
 		b_s[tid] = b[tid];
 		tid += _THREAD_NUM;
 	}
-	int iter_time = ((INTERVAL_TRANSFER - 1) / LOOPTIME + 1) * ISLAND_NUM;
-	int n = 1, n_island = 1;
-	
+	int iter_time = ((INTERVAL_TRANSFER - 1) / LOOPTIME + 1) * 2;
+	int n = 1;
+
 	//创建r数组并设为-1，为后续的同步做准备
 	__shared__ float r[LOOPTIME * INDIV_PERBLOCK * 2];//每个个体分到两个变量用于保存r1和r2;
 	
 	CrossPrep(r, indiv_num, _THREAD_NUM, n, &state, 0);
-	
+
 	int interval_migra = LOOPTIME;//数据传输间隙迭代次数
 
-	int migra_time = (INTERVAL_MIGRA / LOOPTIME) * ISLAND_NUM;
+	int migra_time = (INTERVAL_MIGRA / LOOPTIME) * 2;
 	for (int i = 0; i < iter_time; ++i) {
-		// if (iter_time - i == 2) {
-		// 	interval_migra = (INTERVAL_TRANSFER * 2 - LOOPTIME * i) / (2);
-		// }
+		if (iter_time - i == 2) {
+			interval_migra = (INTERVAL_TRANSFER * 2 - LOOPTIME * i) / (2);
+		}
 		//遗传操作和数据加载并行进行，对线程进行划分
 			if (threadIdx.x < THREAD_FOR_OPERA) {//前THREAD_FOR_OPERA个线程用来计算
 				for (int j = 0; j < interval_migra; ++j) {
 					//变异
 					tid = threadIdx.x;
+					__syncthreads();
 					
 					//indivval_test(indivs_in_s, indivs_eval, 0, 1 - n, i);
 					//交叉,此处以维度为单位
-					CrossOver(indiv_num, n, &state, indivs_in_s, range, r + (1 - n) * indiv_perblock * LOOPTIME, indivs);
-					
+					CrossOver(indiv_num, n, &state, indivs_in_s, range, r, indivs);
+					__syncthreads();
 					tid = threadIdx.x;
-					namedBarrierSync(2, THREAD_FOR_OPERA);
 
 					Mutation(indiv_num, n, &state, indivs_in_s, range);
                     
-					namedBarrierSync(2, THREAD_FOR_OPERA);
+					__syncthreads();
 					//筛选 + 更新
 					evaluation(*type, M_s, b_s, indivs_in_s + 2 * group_interval, indiv_num, indivs_eval + indiv_perblock * 2, indiv_perblock);//1s左右时间
 					//变异与交叉需要异步，故此处需要线程同步
-					namedBarrierSync(2, THREAD_FOR_OPERA);
+					__syncthreads();
 					Selection(indiv_num, n, indivs_eval, indivs_in_s);
+					
 					
 				}
 
@@ -1371,7 +1323,14 @@ __global__ void GeneticOpera(float* indivs, volatile int* syncval, curandState* 
 				tid = threadIdx.x - THREAD_FOR_OPERA;
 
 				if (i > 0) {
-					SharedToGlobal(indivs, indivs_in_s, indivs_eval, eval, &state, shuffle, n, n_island, THREAD_FOR_TRANSFER);
+
+					SharedToGlobal(indivs, indivs_in_s, indivs_eval, eval, &state, shuffle, n, THREAD_FOR_TRANSFER);
+				}
+				else{
+					__syncthreads();
+					__syncthreads();
+					__syncthreads();
+					__syncthreads();
 				}
 
 
@@ -1385,39 +1344,44 @@ __global__ void GeneticOpera(float* indivs, volatile int* syncval, curandState* 
 					atomicAdd((int*)(syncval + i), 1);
 					//保证同步,忙等待直到对应的同步锁值更新
 				}
-				__threadfence();
-				namedBarrierSync(1, THREAD_FOR_TRANSFER);
+					
+				__syncthreads();
 				CrossPrep(r, indiv_num, THREAD_FOR_TRANSFER, 1 - n, &state, THREAD_FOR_OPERA);
                 while (*(syncval + i) % gridDim.x != 0) {
                 }
-				namedBarrierSync(1, THREAD_FOR_TRANSFER);
-				SelectFromBlocks(n, n_island, indivs_in_s, indivs_eval, indivs, eval, select_interval, i);
+                __syncthreads();
+				SelectFromBlocks(n, indivs_in_s, indivs_eval, indivs, eval, select_interval, i);
 				
 				
                 //if(threadIdx.x - THREAD_FOR_OPERA  == 0 && blockIdx.x == 0){
                 //   printf("here..2\n");
                 //}
-			
+
+
+				__syncthreads();
+					
+               if(*type == 4){
+				__syncthreads();
+
+			   }
+               
+				
 			}
 			
-         
+          
 		
-		n_island = (n_island + 1) % ISLAND_NUM;
-		n = (n + 1) % 2;
-		// __threadfence();
-		__syncthreads();
-		if(i % migra_time < (ISLAND_NUM - 1) && i > (ISLAND_NUM - 1)){
+		
+			n = (n + 1) % 2;
+		__threadfence();
+		if ((i + 1) % migra_time == 0 && i != iter_time - 1 && i % (INTERVAL_MIGRA * 2) == 0) {
 			IslandMigration(idx_forSort, indivs_eval, indivs_in_s, indiv_num);	
 		}
-		// if (i != iter_time - 1 && i % (INTERVAL_MIGRA * ISLAND_NUM) == 0) {
-		// 	IslandMigration(idx_forSort, indivs_eval, indivs_in_s, indiv_num);	
-		// }
 		
 		__syncthreads();
 		
 
 	}
-	SharedToGlobal(indivs, indivs_in_s, indivs_eval, eval, &state, shuffle, n, n_island,  _THREAD_NUM);
+	SharedToGlobal(indivs, indivs_in_s, indivs_eval, eval, &state, shuffle, n, _THREAD_NUM);
 	states[blockDim.x * blockIdx.x + threadIdx.x] = state;
                // if(threadIdx.x - THREAD_FOR_OPERA == 0 && blockIdx.x == 0){
               //      printf("here..6\n");
@@ -1427,14 +1391,14 @@ __global__ void GeneticOpera(float* indivs, volatile int* syncval, curandState* 
 
 __global__ void evaluate(float* indivs_, float* eval, float* M, float* b, int* type) {
 
-	int indiv_perblock = INDIV_PERBLOCK * ISLAND_NUM, unit = INDIV_PERBLOCK * ISLAND_NUM;
+	int indiv_perblock = INDIV_PERBLOCK * 2, unit = INDIV_PERBLOCK * 2;
 	int init_indiv = blockIdx.x * indiv_perblock;
 
 	if (blockIdx.x == BLOCK_NUM - 1) {
 		indiv_perblock = INDIVNUM - unit * (BLOCK_NUM - 1);
 	}
-	__shared__ float indivs[INDIV_PERBLOCK * ISLAND_NUM * DIMENSION];//大小不能超出indiv_perblock * DIMENSION
-	__shared__ float indivs_val[INDIV_PERBLOCK * ISLAND_NUM];//大小不能超出indiv_perblock * DIMENSION
+	__shared__ float indivs[INDIV_PERBLOCK * 2 * DIMENSION];//大小不能超出indiv_perblock * DIMENSION
+	__shared__ float indivs_val[INDIV_PERBLOCK * 2];//大小不能超出indiv_perblock * DIMENSION
 
 	//传值到shared memory
 	int tid = threadIdx.x;
@@ -1513,16 +1477,13 @@ __global__ void test_func(float* INDIVIDUALS, int cthread_idx, int* type, DS* in
 
 __global__ void knowledgeTransfer(curandState* state, int *type, float* M, float* b, DS* indivs_sort_1, DS* indivs_sort_2) {
 
-	__shared__ float indivs_self[int((TRANSFER_NUM - 1) / BLOCK_NUM + 1) * DIMENSION];
-	__shared__ float indivs_target[int((TRANSFER_NUM - 1) / BLOCK_NUM + 1) * DIMENSION];
+	__shared__ float indivs_self[int(TRANSFER_NUM / BLOCK_NUM) * DIMENSION];
+	__shared__ float indivs_target[int(TRANSFER_NUM / BLOCK_NUM) * DIMENSION];
 
-	__shared__ float indivs_eval_t[((TRANSFER_NUM - 1) / BLOCK_NUM + 1)];//保存值
+	__shared__ float indivs_eval_t[TRANSFER_NUM / BLOCK_NUM];//保存值
 
 
 	int indiv_perblock = TRANSFER_NUM / BLOCK_NUM;
-	if(blockIdx.x < TRANSFER_NUM % BLOCK_NUM){
-		indiv_perblock += 1;
-	}
 	float range_1 = Range[type[0] * 2 + 1] - Range[type[0] * 2];
 	float range_2 = Range[type[1] * 2 + 1] - Range[type[1] * 2];
 	int tid = threadIdx.x;
@@ -1544,7 +1505,6 @@ __global__ void knowledgeTransfer(curandState* state, int *type, float* M, float
 		b_s[tid] = b[tid];
 		tid += t_n;
 	}
-	__threadfence();
 	__syncthreads();
 	//交叉
 	tid = threadIdx.x;
@@ -1556,15 +1516,13 @@ __global__ void knowledgeTransfer(curandState* state, int *type, float* M, float
 		}
 		tid += t_n;
 	}
-	__threadfence();
 	__syncthreads();
 	//评估
 	evaluation(type[0], M_s, b_s, indivs_self, indiv_perblock, indivs_eval_t, indiv_perblock);
-	__threadfence();
 	__syncthreads();
 	//对比，替换
 	tid = threadIdx.x;
-	__shared__ int temp[((TRANSFER_NUM - 1) / BLOCK_NUM + 1)];//记录哪些个体可以被替换,并替换eval值
+	__shared__ int temp[TRANSFER_NUM / BLOCK_NUM];//记录哪些个体可以被替换,并替换eval值
 	while (tid < indiv_perblock) {
 		int target_tid = blockIdx.x * indiv_perblock + INDIVNUM - TRANSFER_NUM + tid;
 		if (indivs_eval_t[tid] < *indivs_sort_1[target_tid / BANKSIZE].eval_pointer[target_tid % BANKSIZE]) {
@@ -1576,7 +1534,6 @@ __global__ void knowledgeTransfer(curandState* state, int *type, float* M, float
 		}
 		tid += t_n;
 	}
-	__threadfence();
 	__syncthreads();
 	
 	tid = threadIdx.x;
@@ -1614,200 +1571,144 @@ __global__ void messageTransfer(float* indiv_best, float* indival_best, DS* indi
 	}
 }
 
-struct TaskMessage{
-	int cur_iter;
-	queue<int> waiting_line;
-	cudaEvent_t event, event_1;
-	int record_1 = 0;
-	pthread_mutex_t task_mutex=PTHREAD_MUTEX_INITIALIZER;
-	// mutex task_mutex;
-	pthread_cond_t cond;
-	TaskMessage(int cur_iter = 0){
-		this->cur_iter = cur_iter;	
-		
-		cudaEventCreate(&event);
-		cudaEventCreate(&event_1);
-		pthread_cond_init(&cond, nullptr);
-	}
-};
-map<int, TaskMessage*> tasks_set;
-vector<int> tasks_vec;
-TaskMessage task_ms[T];
-double response_time[T], receive_time[T], solve_time[T];
-
-double cpuSecond() {
-    struct timeval tp;
-    gettimeofday(&tp,NULL);
-    return ((double)tp.tv_sec + (double)tp.tv_usec*1.e-6);
-}
-
 int last_transfer = transfer_num;
-DS record[T][ISLAND_NUM][ITER_NUM / INTERVAL_TRANSFER + 1];
-void iter(int task_idx, int cthread_idx , cudaStream_t* streams) {
-	cudaEvent_t finish_sign;
-	cudaEventCreate(&finish_sign);
-	pthread_mutex_lock(&iter_mutex);
-	tasks_set[task_idx] = &task_ms[task_idx];
-	tasks_vec.push_back(task_idx);
-	pthread_mutex_unlock(&iter_mutex);
-
-	// mutex cond_mutex_w, cond_mutex_f;
-	// unique_lock<mutex> cond_lock_w(cond_mutex_w);
-	// unique_lock<mutex> cond_lock_f(cond_mutex_f);
-	int wait_num = 0;
-	int blocknum = ISLAND_NUM * VAL_TYPE, threadnum = INDIVNUM_ISLAND * _THREAD_NUM * DIMENSION / SHARED_CAPACITY;
+DS record[T][2][ITER_NUM / INTERVAL_TRANSFER + 1];
+void iter(int task_idx, int cthread_idx, cudaStream_t* streams) {
+	mutex cond_mutex_w, cond_mutex_f;
+	unique_lock<mutex> cond_lock_w(cond_mutex_w);
+	unique_lock<mutex> cond_lock_f(cond_mutex_f);
 	
+	int blocknum = ISLAND_NUM * VAL_TYPE, threadnum = INDIVNUM_ISLAND * _THREAD_NUM * DIMENSION / SHARED_CAPACITY;
+
 	pop_init << <BLOCK_NUM, _THREAD_NUM, 0, streams[cthread_idx % STREAM_NUM] >> > (devStates+ _THREAD_NUM * BLOCK_NUM * (cthread_idx % STREAM_NUM), INDIVIDUALS[cthread_idx], task_type[cthread_idx], indiv_val[cthread_idx]);
 	int memory_cost = 3 * ((int)(WARPSIZE / (2 * INDIV_PERBLOCK) + 1)) * (2 * INDIV_PERBLOCK) * sizeof(float);
-	
 	evaluate<<<BLOCK_NUM, THREAD_FOR_OPERA, memory_cost, streams[cthread_idx % STREAM_NUM]>>>(INDIVIDUALS[cthread_idx], indiv_val[cthread_idx], M_cpu[task_idx], b_cpu[task_idx], task_type[cthread_idx]);
 	//种群排序
 	//种群迭代
 		
 	popSort << <1, _THREAD_NUM, 0, streams[cthread_idx % STREAM_NUM] >> >(indiv_sort[cthread_idx], indiv_val[cthread_idx], INDIVIDUALS[cthread_idx], task_type[cthread_idx]);
-	
-	int iter_time = ITER_NUM / INTERVAL_TRANSFER;
-	for (int i = 0; i < iter_time; ++i) {
+	//if(cthread_idx == 0){
+	//	test_func<<<1, 1>>>(INDIVIDUALS[cthread_idx], cthread_idx, task_type[cthread_idx], indiv_sort[cthread_idx], indiv_val[cthread_idx]);
+	//}
+	cudaStreamSynchronize(streams[cthread_idx % STREAM_NUM]);
+	cudaMemcpyAsync(&record[cthread_idx][0][0], indiv_sort[cthread_idx], sizeof(DS), cudaMemcpyDeviceToHost, streams[cthread_idx % STREAM_NUM]);
+	cudaMemcpyAsync(&record[cthread_idx][1][0], indiv_sort[cthread_idx] + ((INDIVNUM - 1) / BANKSIZE), sizeof(DS), cudaMemcpyDeviceToHost, streams[cthread_idx % STREAM_NUM]);
+		/*
+		dim3 dimBlock(THREAD_NUM, 1, 1);
+		dim3 dimGrid(BLOCK_NUM, 1, 1);
+		
+		void* kernelArgs[] = {
+			(void*)&INDIVIDUALS[cthread_idx],
+			 (void*)&syncval[cthread_idx],
+			  (void*)&devStates+ _THREAD_NUM * BLOCK_NUM * cthread_idx % STREAM_NUM,
+			   (void*)&task_type[cthread_idx],
+			    (void*)&M_cpu[cthread_idx],
+				(void*)&b_cpu[cthread_idx],
+				(void*)&indiv_val[cthread_idx]
+				 };
+		*/
+		
+	for (int i = 0; i < ITER_NUM / INTERVAL_TRANSFER; ++i) {
 		//进行遗传操作以及适应度评估（为了最大化shared memory效用，此处进行INTERVAL_TRANSFER次迭代）
 		//cudaLaunchCooperativeKernel((void*)GeneticOpera, dimGrid, dimBlock, kernelArgs, 3 * ((int)(WARPSIZE / INDIV_PERBLOCK + 1)) * INDIV_PERBLOCK * sizeof(float), streams[cthread_idx % STREAM_NUM]);
-		
 		intervalRand<<<3, _THREAD_NUM, 0, streams[cthread_idx % STREAM_NUM]>>>(select_interval[cthread_idx], devStates+ _THREAD_NUM * BLOCK_NUM * (cthread_idx % STREAM_NUM));
-		
+		//pv.wait();
 		GeneticOpera << <BLOCK_NUM, _THREAD_NUM, 3 * ((int)(WARPSIZE / INDIV_PERBLOCK + 1)) * INDIV_PERBLOCK * sizeof(float), streams[cthread_idx % STREAM_NUM]  >> > (INDIVIDUALS[cthread_idx], (volatile int*)syncval[cthread_idx], devStates+ _THREAD_NUM * BLOCK_NUM * (cthread_idx % STREAM_NUM), task_type[cthread_idx], M_cpu[task_idx], b_cpu[task_idx], indiv_val[cthread_idx], select_interval[cthread_idx]);
-		
-		for(int j = 0; j < wait_num; ++j){
-			int target_id = tasks_set[task_idx]->waiting_line.front();
-			pthread_mutex_lock(&iter_mutex);
-			tasks_set[task_idx]->waiting_line.pop();
-			pthread_mutex_unlock(&iter_mutex);
-			while(tasks_set[target_id]->record_1 == 0){
-			}
-			cudaEventSynchronize(tasks_set[target_id]->event_1);
-			pthread_mutex_lock(&tasks_set[target_id]->task_mutex);
-			tasks_set[target_id]->record_1 -= 1;
-			pthread_mutex_unlock(&tasks_set[target_id]->task_mutex);
-		}
 		popSort << <1, _THREAD_NUM, 0, streams[cthread_idx % STREAM_NUM] >> >(indiv_sort[cthread_idx], indiv_val[cthread_idx], INDIVIDUALS[cthread_idx], task_type[cthread_idx]);
-		
-		cudaEventRecord(tasks_set[task_idx]->event, streams[cthread_idx % STREAM_NUM]);
-		
-		if(i == max_iter[task_idx]){
-			pthread_mutex_lock(&iter_mutex);
-			int target = tasks_vec[rand() % tasks_vec.size()];
-			while((target == task_idx || !(tasks_set[target]->cur_iter < iter_time)) && tasks_vec.size() > 1){
-				target = tasks_vec[rand() % tasks_vec.size()];
-			}
-			cudaMemcpyAsync(&task_type[task_idx][1], &tasks_type[target], sizeof(int), cudaMemcpyHostToDevice, streams[cthread_idx % STREAM_NUM]);
-			tasks_set[target]->waiting_line.push(task_idx);
-			pthread_cond_broadcast(&tasks_set[task_idx]->cond);
-			wait_num = tasks_set[task_idx]->waiting_line.size();
-			tasks_set[task_idx]->cur_iter += 1;
-			if(target != task_idx && !(tasks_set[target]->cur_iter < iter_time)){
-				pthread_cond_wait(&tasks_set[target]->cond, &iter_mutex);
-			}
-			
-			pthread_mutex_unlock(&iter_mutex);
-			int memory_cost = 3 * ((int)(WARPSIZE / (TRANSFER_NUM / BLOCK_NUM) + 1)) * (TRANSFER_NUM / BLOCK_NUM) * sizeof(float);
-
-			cudaEventSynchronize(tasks_set[target]->event);
-			
-			// knowledgeTransfer << < BLOCK_NUM, THREAD_FOR_OPERA, memory_cost, streams[cthread_idx % STREAM_NUM]>> > (devStates+ _THREAD_NUM * BLOCK_NUM * cthread_idx % STREAM_NUM, task_type[cthread_idx], M_cpu[task_idx], b_cpu[task_idx], indiv_sort[cthread_idx], indiv_sort[target]);
-			
-			cudaEventRecord(tasks_set[task_idx]->event_1, streams[cthread_idx % STREAM_NUM]);
-			pthread_mutex_lock(&tasks_set[task_idx]->task_mutex);
-			tasks_set[task_idx]->record_1 += 1;
-			pthread_mutex_unlock(&tasks_set[task_idx]->task_mutex);
-
-			max_iter[task_idx] += 1;
+		cudaStreamSynchronize(streams[cthread_idx % STREAM_NUM]);
+		//pv.signal();
+		cudaError_t cudaStatus = cudaGetLastError();
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "\n%s\n", cudaGetErrorString(cudaStatus));
 		}
+        /*
+		iter_mutex.lock();
+		if (!achieve[task_idx]) {
+			achieve_num += 1;
+			achieve[task_idx] = true;
+		}
+		iter_mutex.unlock();
+			*/
+	cudaMemcpyAsync(&record[cthread_idx][0][i + 1], indiv_sort[cthread_idx], sizeof(DS), cudaMemcpyDeviceToHost, streams[cthread_idx % STREAM_NUM]);
+	//cudaMemcpyAsync(&record[cthread_idx][1][i + 1], indiv_sort[cthread_idx] + ((INDIVNUM - 1) / BANKSIZE) * BANKSIZE * (sizeof(float) + sizeof(float*) + sizeof(float*)), (sizeof(float) + sizeof(float*) + sizeof(float*)), cudaMemcpyDeviceToHost, streams[cthread_idx % STREAM_NUM]);
+	//cudaMemcpyAsync(&record[cthread_idx][i + 1], indiv_sort[cthread_idx], sizeof(DS), cudaMemcpyDeviceToHost, streams[cthread_idx % STREAM_NUM]);
+	
+		/*
+		if (achieve_num == transfer_num || i == max_iter[task_idx] || i == ITER_NUM / INTERVAL_TRANSFER - 1) {
+			int target = rand() % T;
+			while (target == task_idx) {
+				target = rand() % T;
+			}
+			cudaMemcpyAsync(&task_type[cthread_idx][1], &tasks_type[target], sizeof(int), cudaMemcpyHostToDevice, streams[cthread_idx % STREAM_NUM]);
+			if (achieve[task_idx]) {
+				//等待所有线程就绪
+				iter_mutex.lock();
+				waiting_num += 1;
+				iter_mutex.unlock();
+				if (waiting_num == transfer_num) {//使得两者相等的路口有两个，一个是waiting_num增加，另一个是transfer_num减少
+                    last_transfer = transfer_num;
+					finish_num = 0;
+					wait_line.notify_all();
+				}
+				else {
+					wait_line.wait(cond_lock_w, []{return waiting_num == transfer_num ? true : false;});
+				}
+				//知识迁移
+                int memory_cost = 3 * ((int)(WARPSIZE / (TRANSFER_NUM / BLOCK_NUM) + 1)) * (TRANSFER_NUM / BLOCK_NUM) * sizeof(float);
+				knowledgeTransfer << < BLOCK_NUM, THREAD_FOR_OPERA, memory_cost, streams[cthread_idx % STREAM_NUM]>> > (devStates+ _THREAD_NUM * BLOCK_NUM * cthread_idx % STREAM_NUM, task_type[cthread_idx], M_cpu[task_idx], b_cpu[task_idx], indiv_sort[cthread_idx], indiv_sort[target]);
+
+				iter_mutex.lock();
+				achieve_num -= 1;
+				//重置事件
+				achieve[task_idx] = false;
+				max_iter[task_idx] += 3;
+                    finish_num += 1;
+				if (achieve_num == 0) {
+					iter_time += 1;
+					waiting_num = 0;
+					finish_line.notify_all();
+				    iter_mutex.unlock();
+				}
+                else{
+					iter_mutex.unlock();
+					finish_line.wait(cond_lock_f, []{return finish_num == last_transfer ? true:false;});
+                }
+			}
+		}
+		*/
+		//if(cthread_idx == 0){
+			//popSort << <1, _THREAD_NUM, 0, streams[cthread_idx % STREAM_NUM] >> >(indiv_sort[cthread_idx], indiv_val[cthread_idx], INDIVIDUALS[cthread_idx], task_type[cthread_idx]);
+		//	test_func<<<1, 1>>>(INDIVIDUALS[cthread_idx], cthread_idx, task_type[cthread_idx], indiv_sort[cthread_idx], indiv_val[cthread_idx]);
+		//}
+		
 	}
 	
-	// iter_mutex.lock();
-	// transfer_num -= 1;
-	// if (transfer_num == waiting_num) {
-	// 	wait_line.notify_all();
-	// }
-	// iter_mutex.unlock();
-
-	cudaEventRecord(finish_sign, streams[cthread_idx % STREAM_NUM]);
-	pthread_mutex_lock(&iter_mutex);
-	pthread_cond_broadcast(&tasks_set[task_idx]->cond);
-	// tasks_set.erase(task_idx);
-	tasks_vec.erase(find(tasks_vec.begin(), tasks_vec.end(), task_idx));
-	pthread_mutex_unlock(&iter_mutex);
-
-	cudaEventSynchronize(finish_sign);
-
-	solve_time[task_idx] = cpuSecond();
-
-	// popTransfer_(cthread_idx, &streams[cthread_idx % STREAM_NUM]);
+	iter_mutex.lock();
+	transfer_num -= 1;
+	if (transfer_num == waiting_num) {
+		wait_line.notify_all();
+	}
+	iter_mutex.unlock();
+	
+		//popTransfer_(cthread_idx, &streams[cthread_idx % STREAM_NUM]);
 	//messageTransfer<<<BLOCK_NUM, _THREAD_NUM, 0, streams[cthread_idx % STREAM_NUM]>>>(INDIV_BEST_GPU[cthread_idx], INDIVVAL_BEST_GPU[cthread_idx], indiv_sort[cthread_idx]);
-}
-
-
-
-unsigned int getMemoryUsage() {
-  std::ifstream statm("/proc/self/statm");
-  unsigned int physicalMem = 0;
-  statm >> physicalMem;
-  statm.close();
-  return physicalMem * 4;
-}
-
-int GetSysMemInfo() {  //获取系统当前可用内存
-        int mem_free = -1;//空闲的内存，=总内存-使用了的内存
-        int mem_total = -1; //当前系统可用总内存
-        int mem_buffers = -1;//缓存区的内存大小
-        int mem_cached = -1;//缓存区的内存大小
-        char name[20];
- 
-        FILE *fp;
-        char buf1[128], buf2[128], buf3[128], buf4[128], buf5[128];
-        int buff_len = 128;
-        fp = fopen("/proc/meminfo", "r");
-        if (fp == NULL) {
-            std::cerr << "GetSysMemInfo() error! file not exist" << std::endl;
-            return -1;
-        }
-        if (NULL == fgets(buf1, buff_len, fp) ||
-            NULL == fgets(buf2, buff_len, fp) ||
-            NULL == fgets(buf3, buff_len, fp) ||
-            NULL == fgets(buf4, buff_len, fp) ||
-            NULL == fgets(buf5, buff_len, fp)) {
-            std::cerr << "GetSysMemInfo() error! fail to read!" << std::endl;
-            fclose(fp);
-            return -1;
-        }
-        fclose(fp);
-        sscanf(buf1, "%s%d", name, &mem_total);
-        sscanf(buf2, "%s%d", name, &mem_free);
-        sscanf(buf4, "%s%d", name, &mem_buffers);
-        sscanf(buf5, "%s%d", name, &mem_cached);
-        int memLeft = mem_free + mem_buffers + mem_cached;
-        return mem_total - mem_free;
 }
 
 int main()
 {
-	double avg_mem_used = 0, max_mem_used = 0;
-	double already_used = (32488476 - 4609960) / pow(2, 10);
-	double init_mem = (double(GetSysMemInfo()) / pow(2, 10)) - already_used;
-
-	printf("InitMemoryUsage: %lf\n", double(GetSysMemInfo()) / pow(2, 20));
 	int dev = 0;
 	int supportsCoopLaunch = 0;
 	//printf("count：%d\n", pv.getCount());
 	
 	cudaDeviceGetAttribute(&supportsCoopLaunch, cudaDevAttrCooperativeLaunch, dev);
-	printf("> %d\n", supportsCoopLaunch);
+	//printf("> %d\n", supportsCoopLaunch);
 	
 	cudaDeviceProp deviceProp;
 	cudaGetDeviceProperties(&deviceProp, dev);
-	printf("> Using Device %d: %s\n", dev, deviceProp.name);
+	//printf("> Using Device %d: %s\n", dev, deviceProp.name);
 	cudaSetDevice(dev);
 
 	// check if device support hyper-q
-	
 	if (deviceProp.major < 3 || (deviceProp.major == 3 && deviceProp.minor < 5))
 	{
 		if (deviceProp.concurrentKernels == 0)
@@ -1826,6 +1727,15 @@ int main()
 	//printf("> Compute Capability %d.%d hardware with %d multi-processors\n",
 	//	deviceProp.major, deviceProp.minor, deviceProp.multiProcessorCount);
 
+	
+	cudaEvent_t time_start, time_stop;
+	cudaEventCreate(&time_start);
+	cudaEventCreate(&time_stop);
+	cudaEventRecord(time_start, 0);
+	cudaEventSynchronize(time_start);
+	initialization();
+
+
 	//创建并发流
 	cudaStream_t stream[STREAM_NUM];
 	for (int i = 0; i < STREAM_NUM; ++i) {
@@ -1837,109 +1747,31 @@ int main()
 	mutex t_mutex;
 	//pthread_t threads[CPU_THREAD_NUM];
     thread threads[CPU_THREAD_NUM];
+	int task_idx = 0;
+
+
+
+	for (int i = 0; i < CPU_THREAD_NUM; ++i) {
+        /*
+		args.task_idx = task_idx;
+		args.cthread_idx = i;
+		args.type = tasks_type[i];
+        */
+		threads[i] = thread(iter, task_idx, i, stream);
+		t_mutex.lock();
+		task_idx += 1;
+		t_mutex.unlock();
+	}
+	for (int i = 0; i < CPU_THREAD_NUM; ++i) {
+		threads[i].join();
+	}
 	
-	//寻找最佳迭代时间
-	tasks_split[0] = 0;
-	tasks_split[BATCH_NUM] = T;
-	getRandNum(tasks_split + 1, BATCH_NUM - 1, 0, T);
-	sort(tasks_split, tasks_split + BATCH_NUM);
-
-	for(int i = 0; i < BATCH_NUM; ++i){
-		st_time[i] = getRandFloat(0.f, 100.f);//0~1000ms等待时间
-	}
-
-	//时间记录
-	double time = 0;
-	for(int i = 0; i < BATCH_NUM; ++i){
-		
-		int task_num = tasks_split[i + 1] - tasks_split[i];
-		int task_init = tasks_split[i];
-		for(int j = 0; j < task_num; ++j){
-			receive_time[task_init + j] = time;
-		}
-		time += st_time[i];
-		st_time[i] = time;
-	}
-
-
-	cudaEvent_t time_start, time_stop;
-	cudaEventCreate(&time_start);
-	cudaEventCreate(&time_stop);
-	cudaEventRecord(time_start, 0);
-	cudaEventSynchronize(time_start);
-	double t_start = cpuSecond();
-
-
-	initialization();
-
 	cudaEventRecord(time_stop, 0);
 	cudaEventSynchronize(time_stop);
 	float elapsedTime;
 	cudaEventElapsedTime(&elapsedTime, time_start, time_stop);
 	printf("\nruntime=%f ms, %f, %f \n", elapsedTime, time_start, time_stop);
-
-	int task_idx = 0;
-	// unordered_map<int, TaskMessage> tasks_set;
-
-	double task_start = cpuSecond();
-	for(int i = 0; i < BATCH_NUM; ++i){
-		
-		int task_num = (i == BATCH_NUM - 1) ? (T - tasks_split[i]) : (tasks_split[i + 1] - tasks_split[i]);
-		int task_init = tasks_split[i];
-		printf("task_init: %d, task_num: %d\n", task_init, task_num);
-		// double iStart = cpuSecond();
-		int j_end = i == BATCH_NUM - 1 ? T : tasks_split[i + 1];
-		for(int j = tasks_split[i]; j < j_end; ++j){
-			response_time[task_idx] = cpuSecond();
-			threads[j] = thread(iter, task_idx, j, stream);
-			t_mutex.lock();
-			task_idx += 1;
-			t_mutex.unlock();
-			
-			// threads[j].detach();
-		}
-		double iElaps = cpuSecond() - task_start;
-		if(BATCH_NUM > 1 && iElaps < st_time[i] / 1000.f){
-			// sleep(st_time[i] / 1000.f - iElaps);
-			this_thread::sleep_for(chrono::milliseconds(long(st_time[i] - iElaps * 1000.f)));
-			printf("sleep time: %f\n", st_time[i] / 1000.f - iElaps);
-		}
-		printf("MemoryUsage: %lf\n", (double(GetSysMemInfo()) / pow(2, 10)) - already_used);
-		if(max_mem_used < (double(GetSysMemInfo()) / pow(2, 10)) - already_used){
-			max_mem_used = (double(GetSysMemInfo()) / pow(2, 10)) - already_used;
-		}
-		avg_mem_used += (double(GetSysMemInfo()) / pow(2, 10)) - already_used;
-	}
-	for (int i = 0; i < CPU_THREAD_NUM; ++i) {
-		threads[i].join();
-	}
-	cudaDeviceSynchronize();
-	cudaError_t cudaStatus = cudaGetLastError();
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "\n%s\n", cudaGetErrorString(cudaStatus));
-	}
-
-	// for (int i = 0; i < CPU_THREAD_NUM; ++i) {
-    //     /*
-	// 	args.task_idx = task_idx;
-	// 	args.cthread_idx = i;
-	// 	args.type = tasks_type[i];
-    //     */
-	// 	threads[i] = thread(iter, task_idx, i, stream);
-	// 	t_mutex.lock();
-	// 	task_idx += 1;
-	// 	t_mutex.unlock();
-	// }
-	// for (int i = 0; i < CPU_THREAD_NUM; ++i) {
-	// 	threads[i].join();
-	// }
-	cudaDeviceSynchronize();
-	cudaEventRecord(time_stop, 0);
-	cudaEventSynchronize(time_stop);
-	elapsedTime;
-	cudaEventElapsedTime(&elapsedTime, time_start, time_stop);
-	printf("\nruntime=%f ms, %f, %f, %f \n", elapsedTime, time_start, time_stop, cpuSecond() - t_start);
-    popTransfer();
+    //popTransfer();
 	int task_debug = -1;
 	for (int i = 0; i < T; ++i) {
 		if (tasks_type[i] == 6) {
@@ -1948,60 +1780,16 @@ int main()
 			break;
 		}
 	}
-	double avg_rs_time = 0, avg_sl_time = 0;
-	for(int i = 0; i < T; ++i){
-		avg_rs_time += response_time[i] * 1000.f - receive_time[i] - task_start * 1000.f;
-		avg_sl_time += solve_time[i] * 1000.f - receive_time[i] - task_start * 1000.f;
-	}
-	avg_rs_time /= T;
-	avg_sl_time /= T;
-	printf("avg_rs_time: %lf ms, avg_sl_time: %lf ms, avg_mem_used: %lf, max_mem_used: %lf, init_mem_used: %lf\n", avg_rs_time, avg_sl_time, avg_mem_used / BATCH_NUM, max_mem_used, init_mem);
+
 	
-	//===================================parameter discussion:time
-	// char* T_num = new char[5], *DIMEN = new char[5];
-	// sprintf(DIMEN,"%d",DIMENSION);
-	// ofstream file;
-	// file.open("time_dimension_self.txt", ios::app);
-	// file << elapsedTime << ", " << "#" << DIMEN;
-	// file << endl;
-	// file.close();
-	//===================================
-
-	//==================================
-	for(int i = 0; i < T; ++i){
-		sort(INDIV_VAL_CPU[i], INDIV_VAL_CPU[i] + INDIVNUM);
-	}
-	ofstream file;
-	file.open("output_0.txt", ios::app);
-	for(int i = 0; i < T; ++i){
-		for(int j = 0; j < INDIVNUM; ++j){
-			file << INDIV_VAL_CPU[i][j] << ' ';
-		}
-		file << endl;
-	}
-	file << endl;
-	file.close();
-	//==================================
-	/*
-	//===================================parameter discussion
-	ofstream file;
-	file.open("time_indivsperblock.txt", ios::app);
-	file << elapsedTime << ", " << "\\" << INDIV_PERBLOCK << ", " << STREAM_NUM;
-	file << endl;
-	file.close();
-	//===================================
-	*/
-
-	/*
 	string s;
 	stringstream ss;
 	ss << setprecision(8) << elapsedTime;
 	s = ss.str();
 	ss.clear();
 	ofstream file;
-	char* T_num = new char[5], *IPB_num = new char[2];
+	char* T_num = new char[5];
 	sprintf(T_num,"%d",T);
-	sprintf(IPB_num, "%d", INDIV_PERBLOCK);
 	for(int k = 0; k < T; ++k){
 	int min = INT_MAX, max = -1;
 	for(int i = 0; i < ITER_NUM / INTERVAL_TRANSFER + 1; ++i){
@@ -2012,24 +1800,20 @@ int main()
 			max = record[k][1][i].eval[0];
 		}
 	}
-	file.open(string("./data_record_T_ANO_") + T_num + string(".txt"), ios::app);
+	file.open(string("./data_record_DE_") + T_num + string(".txt"), ios::app);
 	for(int i = 0; i < ITER_NUM / INTERVAL_TRANSFER + 1; ++i){
-		//printf("%f ", record[k][0][i].eval[0]);
-		//if(record[k][0][i].eval[0] < 0){
-		//	printf("task_val: %f, task_id:%d, task_type:%d\n", record[k][0][i].eval[0], k, tasks_type[k]);
-		//	break;
-		//}
+		printf("%f ", record[k][0][i].eval[0]);
 		file << record[k][0][i].eval[0] << ' ';
 	}
 	file << record[k][1][0].eval[0] << ' ';
 	file << endl;
 	file.close();
 	}
-	file.open(string("./data_record_T_ANO_") + T_num + string(".txt"), ios::app);
-	file << endl;
-	file.close();
+	//file.open(string("./data_record_24_1552_") + T_num + string(".txt"), ios::app);
+	//file << endl;
+	//file.close();
 	//printf("count：%d\n", pv.getCount());
-	*/
+
 	/*
 	string s;
 	stringstream ss;
